@@ -1,0 +1,136 @@
+#!/bin/bash
+OLDIFS="$IFS"
+IFS=$'\n'
+WORKDIR=$HOME/.usb-attacher
+TMPFILE=/tmp/usb-attacher_tmp.xml
+
+while getopts ":v" opt; do
+  case $opt in
+    v)
+      VERBOSE=1
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      ;;
+  esac
+done
+
+if [ ! -d $WORKDIR ]
+then
+  if [ -f $WORKDIR ]
+  then
+    echo "Can't create $WORKDIR directory"
+    exit 1
+  fi
+  mkdir $WORKDIR
+fi
+
+vmarray=(`virsh list |tail -n +3|awk '{print $2}'|head -n +1`)
+devarray=(`lsusb |cut -f 6- -d " "`)
+namearray=(`lsusb |cut -f 7- -d " "`)
+idarray=(`printf '%s\n' ${devarray[@]}|awk '{print $1}'`)
+devnr=`echo ${#devarray[@]}`
+
+vmstring=`printf '%s\n' ${vmarray[@]}`
+#namestring=`printf '%s\n' ${namearray[@]}`
+idstring=`printf '%s|' ${idarray[@]} |sed 's/|$//g'`
+
+ISF=$OLDIFS
+
+if [ ${#vmarray[@]} -eq 0 ]
+then
+  zenity --info --text="There are no VMs online"
+  exit 128
+fi 
+
+for device in "${idarray[@]}"
+do
+  vendor=`echo $device|awk -F ":" '{print $1}'`
+  product=`echo $device|awk -F ":" '{print $2}'`
+  filename=`echo $device|sed 's/:/_/g'`.xml
+  content="<hostdev mode='subsystem' type='usb'>\n  <source>\n    <vendor id='0x$vendor'/>\n    <product id='0x$product'/>\n  </source>\n</hostdev>\n"
+  printf $content > $WORKDIR/$filename
+done
+
+vm=$(zenity --list --text "" --width=800 --height=550 --title="usb-attacher" --column "Running VMs" "$vmstring")
+# TODO get attached devices
+virsh dumpxml $vm > $WORKDIR/$vm.xml
+attached_ids=($(echo -e `xmlstarlet sel -t -m "/domain/devices/hostdev/source" -v "concat(vendor/@id, ':',product/@id, '\n')" $WORKDIR/$vm.xml |sed 's/0x//g'` |grep -v "^:" |grep -v "^$"))
+
+list=()
+
+for i in `seq 1 $devnr`
+do
+  found=0
+  for adev in "${attached_ids[@]}"
+  do
+    if [ "$adev" == "${idarray[i-1]}" ]
+    then
+      found=1
+    fi
+  done
+
+  if [ $found == "1" ]
+  then
+    list+=("TRUE" "${idarray[$i-1]}" "${namearray[$i-1]}")
+  else
+    list+=("FALSE" "${idarray[$i-1]}" "${namearray[$i-1]}")
+  fi
+
+done
+
+selection=$(zenity --list --text "" --width=800 --height=550 --title="usb-attacher" --checklist --column "Attached" --column "ID" --column "Description" "${list[@]}")
+
+if [ "$VERBOSE" == "1" ]
+then
+  echo -e "Selected devices:\n$selection \n" |sed 's/|/\n/g'
+fi
+
+IFS='|' read -r -a selarray <<< "$selection"
+
+for sdev in "${selarray[@]}"
+do
+  found=0
+  for adev in "${attached_ids[@]}"
+  do
+    if [ "$adev" == "$sdev" ]
+    then
+      found=1
+    fi
+  done
+  if [ $found == "0" ]
+  then
+    fn=$WORKDIR/`echo $sdev|sed 's/:/_/g'`.xml
+    if [ "$VERBOSE" == "1" ]
+    then
+      echo "Attaching $sdev"
+      echo "Executing \"virsh attach-device $vm $fn\""
+    fi
+    virsh attach-device $vm $fn
+  fi
+done
+
+for adev in "${attached_ids[@]}"
+do
+  vendid=`echo $adev|awk -F ":" '{print $1}'`
+  prodid=`echo $adev|awk -F ":" '{print $2}'`
+  found=0
+  for sdev in "${selarray[@]}"
+  do
+    if [ "$adev" == "$sdev" ]
+    then
+      found=1
+    fi
+  done
+  if [ $found == "0" ]
+  then
+    grep -B2 -A5 $vendid $WORKDIR/$vm.xml |grep -B3 -A4 $prodid > $TMPFILE
+    if [ "$VERBOSE" == "1" ]
+    then
+      echo "Detaching $adev"
+      echo "Executing \"virsh detach-device $vm $TMPFILE\""
+    fi
+    virsh detach-device $vm $TMPFILE
+    rm $TMPFILE
+  fi
+done
